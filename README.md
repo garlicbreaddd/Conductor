@@ -19,6 +19,11 @@ random digital twin test environment:
     - plane spawns and decelerates, exiting runway at closest exit
     - 
 
+
+algorithm:
+- somehow direct it
+
+
 how to translate actual airports into image?
 - QGIS to turn airport GIS data into exact nodes and edges(GEOJSON)
 - pyQT simulation interface
