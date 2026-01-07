@@ -17,11 +17,6 @@ random digital twin test environment:
 - arriving planes
     - randomly flash to indicate arrival of a plane on runway
     - plane spawns and decelerates, exiting runway at closest exit
-    - 
-
-
-algorithm:
-- somehow direct it
 
 
 how to translate actual airports into image?
