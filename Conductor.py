@@ -242,7 +242,7 @@ class Plane:
         self.speed = DEFAULT_SPEED # Pixels per tick
         self.heading = 0.0 # Degrees
         self.state = "IDLE" # MOVING, HOLD, STOPPED, TURNING, AWAITING_INSTRUCTION
-        self.color = Qt.GlobalColor.cyan
+        self.color = Qt.GlobalColor.magenta
         self.stopped_timer = 0
         self.turn_delay = 0
         self.wait_time = 0 # Time spent in HOLD
