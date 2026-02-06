@@ -1,6 +1,6 @@
 # Conductor
 
-ground traffic control system
+algorithmic ground traffic control system
 
 random digital twin test environment:
 - airport structure

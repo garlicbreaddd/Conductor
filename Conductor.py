@@ -3,6 +3,7 @@ import heapq
 import random
 import sys
 import json
+import os
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGraphicsView, QLabel, QPushButton,
     QGraphicsPixmapItem, QGraphicsScene, QFileDialog, QGraphicsEllipseItem, QGraphicsLineItem, QGraphicsPolygonItem,
@@ -10,8 +11,6 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtGui import QPixmap, QPen, QBrush, QPolygonF
 from PyQt6.QtCore import QTimer, Qt, QPointF
-
-# Optional geodetic transformer
 try:
     from pyproj import Transformer
     _HAVE_PYPROJ = True
@@ -19,12 +18,49 @@ except Exception:
     Transformer = None
     _HAVE_PYPROJ = False
 
+PLANE_SPEED = 30.0
+SEPARATION_TIME = 4.0
+
+class ReservationManager:
+    def __init__(self):
+        self.node_res = {}
+        self.edge_res = {}
+
+    def is_free_node(self, node, start, end, exclude_pid=None):
+        for s, e, pid in self.node_res.get(node, []):
+            if pid == exclude_pid: continue
+            if not (end <= s or start >= e): return False
+        return True
+
+    def is_free_edge(self, u, v, start, end, exclude_pid=None):
+        key = tuple(sorted((u, v)))
+        for s, e, pid in self.edge_res.get(key, []):
+            if pid == exclude_pid: continue
+            if not (end <= s or start >= e): return False
+        return True
+
+    def book_node(self, node, start, end, pid):
+        if node not in self.node_res: self.node_res[node] = []
+        self.node_res[node].append((start, end, pid))
+
+    def book_edge(self, u, v, start, end, pid):
+        key = tuple(sorted((u, v)))
+        if key not in self.edge_res: self.edge_res[key] = []
+        self.edge_res[key].append((start, end, pid))
+
+    def cleanup(self, current_time):
+        threshold = current_time - 10.0
+        
+        for k in list(self.node_res.keys()):
+            self.node_res[k] = [r for r in self.node_res[k] if r[1] > threshold]
+            if not self.node_res[k]: del self.node_res[k]
+            
+        for k in list(self.edge_res.keys()):
+            self.edge_res[k] = [r for r in self.edge_res[k] if r[1] > threshold]
+            if not self.edge_res[k]: del self.edge_res[k]
 
 class InteractiveGraphicsView(QGraphicsView):
-    """
-    QGraphicsView subclass that supports mouse panning and wheel zooming.
-    Middle-click (or Ctrl+left) drag to pan; wheel to zoom under cursor.
-    """
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self._zoom = 0
@@ -81,12 +117,11 @@ class InteractiveGraphicsView(QGraphicsView):
         self.resetTransform()
         self._zoom = 0
 
-
 class GraphManager:
     def __init__(self):
-        self.nodes = {}  # id -> {pos: (x,y), type: str}
-        self.edges = {}  # id -> {start, end}
-        self.adj = {}    # node_id -> [neighbor_id]
+        self.nodes = {}
+        self.edges = {}
+        self.adj = {}
         self.runway_nodes = set()
 
     def add_node(self, node_id, pos, ntype):
@@ -100,8 +135,6 @@ class GraphManager:
         if u in self.nodes and v in self.nodes:
             self.adj[u].append(v)
             self.adj[v].append(u)
-            # Store edge data (undirected for now, or keyed by tuple)
-            # We use sorted tuple to store undirected properties
             key = tuple(sorted((u, v)))
             self.edges[key] = data or {}
 
@@ -119,7 +152,7 @@ class GraphManager:
         return math.hypot(ax - bx, ay - by)
 
     def get_turn_angle(self, p1, p2, p3):
-        """Returns angle deviation in degrees. 0 means straight."""
+        
         x1, y1 = self.get_pos(p1)
         x2, y2 = self.get_pos(p2)
         x3, y3 = self.get_pos(p3)
@@ -133,76 +166,61 @@ class GraphManager:
         
         if mag1 == 0 or mag2 == 0:
             return 0
-            
-        # Clamp for acos safety
         val = dot / (mag1 * mag2)
         val = max(-1.0, min(1.0, val))
         angle_rad = math.acos(val)
         return math.degrees(angle_rad)
 
     def cost(self, prev, curr, nxt, blocked_nodes, reserved_reversed_edges, node_congestion, final_dest=None):
-        # Base distance
         dist = self.heuristic(curr, nxt)
-        
-        # Penalties
         penalty = 0
-        
-        # Turn penalty
         if prev:
             angle = self.get_turn_angle(prev, curr, nxt)
-            # Penalize sharp turns heavily
             penalty += (angle ** 2) * 0.1
-            if angle > 170: # Prevent U-turns
+            if angle > 170:
                 penalty += 1000000
-            
-        # Runway interaction
         if self.nodes[curr]['type'] == 'runway' or self.nodes[nxt]['type'] == 'runway':
-             penalty += 500  # High cost to enter/cross runway unless necessary
-             
-        # Blocked nodes (Soft constraint for pathfinding, but avoided if possible)
+             penalty += 500
         if nxt in blocked_nodes:
-            return float('inf') # Strict Hard Constraint
-            
-        # Avoid Head-on edges (Global Reservation Check)
-        # If we go curr->nxt, we check if anyone has reserved nxt->curr
-        # The set contains (u, v) if someone is going u->v.
-        # If someone is going nxt->curr, the set contains (nxt, curr).
+            return float('inf')
         if reserved_reversed_edges and (nxt, curr) in reserved_reversed_edges:
-            return float('inf') # Strict Hard Constraint
-            
-        # Congestion Penalty
-        # If nxt is heavily booked, add cost
+            return float('inf')
         if node_congestion:
             penalty += node_congestion.get(nxt, 0) * 1000
-
-        # Spawn/Gate Penalty: Do not taxi THROUGH other gates
         if self.nodes[nxt]['type'] == 'spawn':
-             # If nxt is a gate, it's allowed ONLY if it is our final destination or our start.
-             # We generally only care if it's NOT our destination.
              if final_dest and nxt != final_dest:
-                 penalty += 5000000 # Effectively a wall
+                 penalty += 5000000
 
         return dist + penalty
 
-    def find_path(self, start, end, blocked_nodes=set(), reserved_reversed_edges=set(), node_congestion=None):
-        """A* Pathfinding"""
-        queue = [(0, 0, start, None)] # f, g, current, prev
+    def find_path(self, start, end, start_time, reservation_manager, pid, blocked_nodes=set(), reserved_reversed_edges=set(), node_congestion=None):
+        
+        queue = [(0, 0, start, 0.0, None)] 
         came_from = {}
         g_score = {start: 0}
         
         while queue:
-            f, g, current, prev = heapq.heappop(queue)
+            f, g, current, t_elapsed, prev = heapq.heappop(queue)
             
             if current == end:
-                # Reconstruct
                 path = []
-                while current:
-                    path.append(current)
-                    current = came_from.get(current)
+                
+                curr = current
+                while curr:
+                    path.append(curr)
+                    curr = came_from.get(curr)
                 return path[::-1]
 
+            current_real_time = start_time + t_elapsed
+
             for neighbor in self.adj.get(current, []):
-                # Calculate transitional cost
+                dist = self.heuristic(current, neighbor)
+                travel_time = dist / PLANE_SPEED
+                arrival_real_time = current_real_time + travel_time
+                if not reservation_manager.is_free_edge(current, neighbor, current_real_time, arrival_real_time, pid):
+                    continue
+                if not reservation_manager.is_free_node(neighbor, arrival_real_time, arrival_real_time + SEPARATION_TIME, pid):
+                    continue
                 step_cost = self.cost(prev, current, neighbor, blocked_nodes, reserved_reversed_edges, node_congestion, end)
                 
                 if step_cost == float('inf'):
@@ -213,8 +231,10 @@ class GraphManager:
                 if tentative_g < g_score.get(neighbor, float('inf')):
                     came_from[neighbor] = current
                     g_score[neighbor] = tentative_g
+                    
+                    new_t_elapsed = t_elapsed + travel_time
                     h = self.heuristic(neighbor, end)
-                    heapq.heappush(queue, (tentative_g + h, tentative_g, neighbor, current))
+                    heapq.heappush(queue, (tentative_g + h, tentative_g, neighbor, new_t_elapsed, current))
                     
         return None
 
@@ -236,33 +256,29 @@ class Plane:
         self.current_node = start_node
         self.destination_node = end_node
         self.is_arrival = is_arrival
-        self.path = [] # The CURRENT clearance path (subset of full flight)
-        self.target_node = None # Next node in path
-        self.pos = list(self.graph.get_pos(start_node)) # [x, y]
-        self.speed = DEFAULT_SPEED # Pixels per tick
-        self.heading = 0.0 # Degrees
-        self.state = "IDLE" # MOVING, HOLD, STOPPED, TURNING, AWAITING_INSTRUCTION
+        self.path = []
+        self.target_node = None
+        self.pos = list(self.graph.get_pos(start_node))
+        self.speed = DEFAULT_SPEED
+        self.heading = 0.0
+        self.state = "IDLE"
         self.color = Qt.GlobalColor.magenta
         self.stopped_timer = 0
         self.turn_delay = 0
-        self.wait_time = 0 # Time spent in HOLD
-        
-        # Visual item: Polygon for plane shape
-        # Smaller plane shape
+        self.wait_time = 0
+        self.hold_short_timer = 0
         scale = 0.6
         self.poly = QPolygonF([
-            QPointF(0, -10*scale),   # Nose
-            QPointF(5*scale, 5*scale),     # Right Wing
-            QPointF(0, 2*scale),     # Tail center
-            QPointF(-5*scale, 5*scale)     # Left Wing
+            QPointF(0, -10*scale),
+            QPointF(5*scale, 5*scale),
+            QPointF(0, 2*scale),
+            QPointF(-5*scale, 5*scale)
         ])
         
         self.item = ClickablePolygonItem(self.poly, self, director_callback)
         self.item.setBrush(QBrush(self.color))
         self.item.setPen(QPen(Qt.GlobalColor.black, 1))
         self.item.setZValue(10)
-        
-        # Arrival dot
         if self.is_arrival:
              self.dot = QGraphicsEllipseItem(-1, -1, 2, 2, self.item)
              self.dot.setBrush(QBrush(Qt.GlobalColor.black))
@@ -277,7 +293,6 @@ class Plane:
     def set_path(self, path):
         self.path = path
         if len(self.path) > 0:
-            # If path has current node at start, skip it
             if self.path[0] == self.current_node:
                 self.path.pop(0)
                 
@@ -295,13 +310,18 @@ class Plane:
             
         if self.state == "STOPPED":
             self.item.setBrush(QBrush(Qt.GlobalColor.red))
-            # Randomly resume? Logic in director
             return
 
         if self.state == "HOLD":
             self.item.setBrush(QBrush(Qt.GlobalColor.yellow))
-            # wait_time incremented by director
             return 
+        
+        if self.state == "HOLD_SHORT":
+            self.item.setBrush(QBrush(Qt.GlobalColor.cyan))
+            self.hold_short_timer -= 1
+            if self.hold_short_timer <= 0:
+                self.state = "DEPARTING"
+            return
         
         if self.state == "TURNING":
             self.turn_delay -= (1 * speed_mult)
@@ -313,13 +333,9 @@ class Plane:
         
         if not self.target_node:
             return
-
-        # Move towards target
         tx, ty = self.graph.get_pos(self.target_node)
         dx, dy = tx - self.pos[0], ty - self.pos[1]
         dist = math.hypot(dx, dy)
-        
-        # Calculate angle to target
         target_angle = math.degrees(math.atan2(dy, dx)) + 90 
         
         self.heading = target_angle
@@ -327,29 +343,22 @@ class Plane:
         current_speed = self.speed * speed_mult
         
         if dist < current_speed:
-            # Reached node
             self.pos = [tx, ty]
             self.current_node = self.target_node
             
             if self.path:
                 next_node = self.path[0]
-                
-                # Check turn angle
-                # ... existing turn logic ...
-                angle_diff = 0 # Simplified check for now
+                angle_diff = 0
                 if len(self.path) > 0:
-                     pass # Todo: re-add turn logic if needed
+                     pass
                 
                 self.target_node = next_node
                 self.path.pop(0)
-                
-                # ... (Turning logic preserved but simplified for this diff) ...
                     
             else:
                 self.target_node = None
-                self.state = "AWAITING_INSTRUCTION" # Reached end of current clearance
+                self.state = "AWAITING_INSTRUCTION"
         else:
-            # Normalize and move
             move_x = (dx / dist) * self.speed
             move_y = (dy / dist) * self.speed
             self.pos[0] += move_x
@@ -357,91 +366,44 @@ class Plane:
 
         self.update_visual_pos()
 
-DEFAULT_SPEED = 0.1 # Very Slow for debugging
+DEFAULT_SPEED = 0.17
+MIN_SEPARATION_DIST = 60
+CRITICAL_DIST = 25
+FOV_ANGLE = 70
 
 class Director:
-    def __init__(self, graph_manager, scene, log_widget, coll_label, stand_label):
+    def __init__(self, graph_manager, scene, log_widget, coll_label, stand_label, telemetry_label):
         self.graph = graph_manager
         self.scene = scene
         self.log_widget = log_widget
         self.coll_lbl = coll_label
         self.stand_lbl = stand_label
+        self.telemetry_lbl = telemetry_label
         self.planes = []
         self.spawn_timer = 0
-        self.spawn_interval = 20  # ticks
-        self.plane_id_counter = 100 # United 100
+        self.spawn_interval = 2
+        self.plane_id_counter = 100
         self.selected_plane_id = None
-        self.plane_logs = {} # pid -> list of strings
+        self.plane_logs = {}
         
-        self.speed_multiplier = 1.0 # Multiplier
+        self.speed_multiplier = 1.0
         
         self.collision_count = 0
         self.standoff_count = 0
-        
-        # Flight Plan Management
-        # plane_id -> { 'full_path': [], 'current_progress': int }
-        self.flight_plans = {} 
+        self.flight_plans = {}
+        self.res_manager = ReservationManager()
+        self.global_time = 0.0
         
     def select_plane(self, pid):
         self.selected_plane_id = pid
         self.log_widget.clear()
         logs = self.plane_logs.get(pid, [])
         self.log_widget.setText("\n".join(logs))
-        # Highlight visual?
         for p in self.planes:
             if p.id == pid:
                 p.item.setPen(QPen(Qt.GlobalColor.magenta, 2))
             else:
                 p.item.setPen(QPen(Qt.GlobalColor.black, 1))
-
-    def _gather_global_reservations(self):
-        """
-        Builds a set of edges that are 'booked' in reverse by other planes.
-        Uses Flight Plans for future prediction.
-        """
-        reserved_edges = set()
-        node_congestion = {}
-        
-        # Check active plans
-        for pid, plan in self.flight_plans.items():
-            # If plane is arrived, ignore?
-            # We need to filter out planes that are gone?
-            # Actually, flight_plans might stay. Check active planes list.
-            
-            # Find the plane object to verify it's active
-            plane_obj = next((p for p in self.planes if p.id == pid), None)
-            if not plane_obj: continue
-            
-            # Get remaining path from master plan
-            full = plan['full_path']
-            curr = plan['next_index'] # Index of next node to assign?
-            # Actually, the plane is currently AT full[curr-1] or between chunk nodes.
-            # To be safe, let's reserve everything from the current plane position onwards.
-            
-            # Better: current plane path + remaining master plan
-            
-            # 1. Edges in current 'chunk' (plane.path)
-            current_path = []
-            if plane_obj.current_node: current_path.append(plane_obj.current_node)
-            if plane_obj.target_node: current_path.append(plane_obj.target_node)
-            current_path.extend(plane_obj.path)
-            
-            # 2. Remaining master plan (from next_index)
-            remaining_master = full[plan['next_index']:]
-            
-            # Combine
-            future_route = current_path + remaining_master
-            
-            # Edges
-            for i in range(len(future_route) - 1):
-                u, v = future_route[i], future_route[i+1]
-                reserved_edges.add((u, v))
-                
-            # Nodes
-            for n in future_route:
-                node_congestion[n] = node_congestion.get(n, 0) + 1
-                
-        return reserved_edges, node_congestion
 
     def set_speed_multiplier(self, val):
         self.speed_multiplier = val
@@ -449,8 +411,7 @@ class Director:
             p.speed = DEFAULT_SPEED * self.speed_multiplier
 
     def spawn_plane(self):
-        # Throttle logic: 20 planes
-        if len(self.planes) >= 20: 
+        if len(self.planes) >= 50: 
             return
 
         gates = [n for n, data in self.graph.nodes.items() if data['type'] == 'spawn'] 
@@ -466,48 +427,54 @@ class Director:
         if random.random() < 0.5:
              start, end = end, start
              is_arrival = True
-             
+        if not self.res_manager.is_free_node(start, self.global_time, self.global_time + SEPARATION_TIME, self.plane_id_counter):
+            return
+
         p = Plane(self.plane_id_counter, start, end, self.graph, self.select_plane, is_arrival)
         p.speed = DEFAULT_SPEED * self.speed_multiplier
-        
-        # Calculate MASTER PLAN considering ALL OTHER PLANS
-        reserved_edges, node_congestion = self._gather_global_reservations()
-        blocked_nodes = {pl.current_node for pl in self.planes if pl.state == "STOPPED"}
-        
-        # Strictly avoid head-ons with ANY existing plan
-        full_path = self.graph.find_path(start, end, blocked_nodes, reserved_edges, node_congestion)
+        full_path = self.graph.find_path(
+            start, end, 
+            start_time=self.global_time, 
+            reservation_manager=self.res_manager, 
+            pid=self.plane_id_counter
+        )
         
         if full_path:
+            curr_t = self.global_time
+            for i in range(len(full_path) - 1):
+                u = full_path[i]
+                v = full_path[i+1]
+                dist = self.graph.heuristic(u, v)
+                arrival_t = curr_t + (dist / PLANE_SPEED)
+                self.res_manager.book_edge(u, v, curr_t, arrival_t, self.plane_id_counter)
+                self.res_manager.book_node(v, arrival_t, arrival_t + SEPARATION_TIME, self.plane_id_counter)
+                
+                curr_t = arrival_t
+            self.res_manager.book_node(start, self.global_time, self.global_time + SEPARATION_TIME, self.plane_id_counter)
+
             self.flight_plans[self.plane_id_counter] = {
                 'full_path': full_path,
-                'next_index': 0, # Index in full_path we have cleared up to
+                'next_index': 0, 
                 'cleared_to': 0
             }
             
             self.planes.append(p)
             self.scene.addItem(p.item)
-            
-            # Init Message
             self.log_msg(f"UKN{p.id}: Requesting taxi.", p.id)
-            # self.log_msg(f"ATC: UKN{p.id}, Taxi to runway via initial path.") -> Redundant with first command loop
-            
-            # Give first chunk? No, let update loop handle "AWAITING_INSTRUCTION"
             p.state = "AWAITING_INSTRUCTION"
             
             self.plane_id_counter += 1
+            
+        else:
+            pass
 
     def log_msg(self, msg, pid=None):
-        # Extract PID from msg if not provided? 
-        # Better: Pass PID explicitly.
-        # But we called it like `log_msg("...")` before.
-        # Parse PID if needed: "UKN100:"
-        
         target_pid = pid
         if not target_pid:
              if "UKN" in msg:
                  try:
                      parts = msg.split("UKN")
-                     sub = parts[1].split(",")[0].split(":")[0] # "100" from "UKN100"
+                     sub = parts[1].split(",")[0].split(":")[0]
                      target_pid = int(sub)
                  except: pass
 
@@ -521,19 +488,29 @@ class Director:
                 sb = self.log_widget.verticalScrollBar()
                 sb.setValue(sb.maximum())
         else:
-            # System message?
             pass
 
     def update(self):
+        self.global_time += (1/60) * self.speed_multiplier
+        self.res_manager.cleanup(self.global_time)
+        
         self.spawn_timer += 1
         if self.spawn_timer > self.spawn_interval:
             self.spawn_plane()
             self.spawn_timer = 0
-
-        # --- Progressive ATC Logic ---
+        if self.selected_plane_id:
+            found = False
+            for p in self.planes:
+                if p.id == self.selected_plane_id:
+                     self.telemetry_lbl.setText(f"Plane {p.id}\nSpeed: {p.speed*self.speed_multiplier:.1f} px/s\nHeading: {p.heading:.1f}")
+                     found = True
+                     break
+            if not found:
+                self.telemetry_lbl.setText("Plane Lost / Departed")
+        else:
+             self.telemetry_lbl.setText("No Plane Selected")
         for p in self.planes:
             if p.state == "AWAITING_INSTRUCTION":
-                # Check Master Plan
                 plan = self.flight_plans.get(p.id)
                 if not plan: continue
                 
@@ -541,37 +518,22 @@ class Director:
                 curr_idx = plan['next_index']
                 
                 if curr_idx >= len(full):
-                    # Done
                     self.log_msg(f"ATC: UKN{p.id}, Frequency change approved. Good day.")
                     p.state = "ARRIVED"
                     continue
                 
-                # Determine Next Leg (Chunk)
-                # "Taxi to decision node" logic
-                # Scan master plan from curr_idx full[curr_idx] is where we are (or just finished)
-                # We want to find the next node in the path that is an "Intersection" (degree > 2) or the End.
-                
                 end_idx = len(full)
                 found_decision = False
-                
-                # Start searching from the NEXT node
                 for i in range(curr_idx + 1, len(full)):
                     node_id = full[i]
-                    # Check connections
                     degree = len(self.graph.adj.get(node_id, []))
                     
-                    # It's a decision node if:
-                    # 1. It's an intersection (degree > 2)
-                    # 2. It's the destination (last node) - loop handles this naturally if not found earlier
-                    
                     if degree > 2:
-                        end_idx = i + 1 # Include the intersection node in this command
+                        end_idx = i + 1
                         found_decision = True
                         break
                 
                 chunk = full[curr_idx : end_idx]
-                
-                # Update progress
                 plan['next_index'] = end_idx
                 
                 if not chunk:
@@ -579,9 +541,6 @@ class Director:
 
                 target_node = chunk[-1]
                 target_type = self.graph.nodes[target_node]['type']
-                
-                # Analyze Path for Phraseology
-                # 1. Taxiways used
                 used_taxiways = []
                 last_name = None
                 for i in range(len(chunk)-1):
@@ -593,70 +552,56 @@ class Director:
                         
                 route_str = ""
                 if used_taxiways:
-                    # Deduplicate consecutive duplicates just in case
                     route_str = " via " + " ".join(used_taxiways)
                 else:
                     route_str = " via taxiways"
-
-                # 2. Crossing Runways
-                # Check if any intermediate node is a runway
                 crossing_instruction = ""
-                for n in chunk[:-1]: # Exclude last node (that's a hold short or line up)
+                for n in chunk[:-1]:
                     if self.graph.nodes[n]['type'] == 'runway':
                         crossing_instruction += f"; Cross Runway {n}"
-                
-                # 3. Main Instruction
                 atc_cmd = ""
-                
-                # Case A: Entering a Runway for Takeoff
-                # If target is runway AND it's our final destination node
                 if target_type == 'runway' and target_node == full[-1]:
                      atc_cmd = f"Runway {target_node}, Line up and wait{crossing_instruction}."
-                
-                # Case B: Holding Short of a Runway
-                # If target is runway BUT we are not cleared onto it yet (or crossing it next)
-                # Actually, our chunk ends AT the decision node.
-                # If the target node is a runway type, we are holding short of it.
                 elif target_type == 'runway':
                      atc_cmd = f"Hold short of Runway {target_node}{route_str}{crossing_instruction}."
-                
-                # Case C: Progressive Taxi (Intersection)
                 elif found_decision:
                      atc_cmd = f"Taxi to intersection {target_node}{route_str}{crossing_instruction}."
-                
-                # Case D: Generic
                 else:
                      atc_cmd = f"Continue taxi to {target_node}{route_str}{crossing_instruction}."
 
                 self.log_msg(f"ATC: UKN{p.id}, {atc_cmd}")
-
-                # Issue command
                 p.set_path(chunk)
-
-        # Update physics
         for p in self.planes:
             if p.state == "ARRIVED":
                 self.scene.removeItem(p.item)
                 self.planes.remove(p)
                 continue
             
-            p.update(1/60, set())
-
-
-
+            if p.state == "DEPARTING":
+                self.log_msg(f"ATC: UKN{p.id}, Cleared for takeoff. Good day.")
+                self.scene.removeItem(p.item)
+                self.planes.remove(p)
+                continue
+            if p.state == "AWAITING_INSTRUCTION":
+                plan = self.flight_plans.get(p.id)
+                if plan:
+                    full = plan['full_path']
+                    if p.current_node == full[-1] and self.graph.nodes[p.current_node]['type'] == 'runway':
+                        if p.hold_short_timer == 0:
+                            p.hold_short_timer = random.randint(60, 300)
+                            p.state = "HOLD_SHORT"
+                            self.log_msg(f"ATC: UKN{p.id}, Hold position, traffic on final.")
+                            continue
+            p.update(1/60, self.planes)
 
 class MainWindow(QMainWindow):
     def __init__(self):
-        # window setup
         super().__init__()
         self.setWindowTitle("Randomized Test Environment")
         centralwidget = QWidget()
         self.setCentralWidget(centralwidget)
         self.setMinimumWidth(1200)
         self.setMinimumHeight(800)
-
-
-        # widgets
         self.simview = InteractiveGraphicsView()
         self.label = QLabel("Test")
         self.label2 = QLabel("Test2")
@@ -666,38 +611,26 @@ class MainWindow(QMainWindow):
         sidebar2lay = QVBoxLayout()
         self.btn1 = QPushButton(">", self.simview)
         self.btn2 = QPushButton("<", self.simview)
-        self.sidebar2.setVisible(True) # Show sidebar by default now
-        # load buttons for geojson
+        self.sidebar2.setVisible(True)
+        self.loadMapBtn = QPushButton("Load Map Image")
         self.loadNodesBtn = QPushButton("Load Nodes")
         self.loadEdgesBtn = QPushButton("Load Edges")
         self.startSimBtn = QPushButton("Start/Stop Sim")
-        # positioning/scale UI removed (automatic georeference used)
-        # Load world file for georeferencing
-        self._load_world_file()
-        # positioning/scale state removed
-        self.scene = QGraphicsScene(0,0,self.simview.width(),self.simview.height())
-        self.chicagohare = QPixmap("chicagohare.png")
-
-        # simview
-        self.scene.addPixmap(self.chicagohare)
-        # ensure scene rect matches the background image so items are visible
-        try:
-            self.scene.setSceneRect(0, 0, self.chicagohare.width(), self.chicagohare.height())
-        except Exception:
-            pass
-        self.simview.setScene(self.scene)
-
-
-
+        self.pgw_pixel_width = None
+        self.pgw_rotation_x = None
+        self.pgw_rotation_y = None
+        self.pgw_pixel_height = None
+        self.pgw_top_left_x = None
+        self.pgw_top_left_y = None
+        self.transformer = None
         
-
-        # sidebar
+        self.scene = QGraphicsScene(0,0,self.simview.width(),self.simview.height())
+        self.simview.setScene(self.scene)
         sidebar1lay.addWidget(self.label)
+        sidebar1lay.addWidget(self.loadMapBtn)
         sidebar1lay.addWidget(self.loadNodesBtn)
         sidebar1lay.addWidget(self.loadEdgesBtn)
         sidebar1lay.addWidget(self.startSimBtn)
-        
-        # Debug Controls
         self.collisionLabel = QLabel("Collisions: 0")
         self.standoffLabel = QLabel("Standoffs: 0")
         sidebar1lay.addWidget(self.collisionLabel)
@@ -711,70 +644,49 @@ class MainWindow(QMainWindow):
         self.speedSlider.valueChanged.connect(self.update_speed)
         sidebar1lay.addWidget(self.speedSlider)
         self.sidebar1.setLayout(sidebar1lay)
-    
-        # sidebar 2 (ATC Log)
         self.log_output = QTextEdit()
         self.log_output.setReadOnly(True)
         self.log_output.setPlaceholderText("ATC Communication Log...")
-        sidebar2lay.addWidget(QLabel("ATC Frequency 118.7"))
+        sidebar2lay.addWidget(QLabel("ATC Frequency 67.67"))
         sidebar2lay.addWidget(self.log_output)
+        self.telemetry_label = QLabel("No Plane Selected")
+        self.telemetry_label.setStyleSheet("font-weight: bold; border: 1px solid gray; padding: 5px;")
+        sidebar2lay.addWidget(QLabel("Telemetry Data:"))
+        sidebar2lay.addWidget(self.telemetry_label)
+        
         self.sidebar2.setLayout(sidebar2lay)
         self.sidebar2.setMinimumWidth(300)
     
         self.btn1.clicked.connect(self.toggleSidebar1)
         self.btn2.clicked.connect(self.toggleSidebar2)
+        self.loadMapBtn.clicked.connect(self.open_map_dialog)
         self.loadNodesBtn.clicked.connect(self.open_nodes_dialog)
         self.loadEdgesBtn.clicked.connect(self.open_edges_dialog)
         self.startSimBtn.clicked.connect(self.toggle_simulation)
-        # positioning/scale signals removed
         self.sidebar1.hide()
-        # self.sidebar2.hide() # Keep log visible
-
-        #main layout setup
         mainlay = QHBoxLayout()
         mainlay.addWidget(self.sidebar1)
         mainlay.addWidget(self.simview)
         mainlay.addWidget(self.sidebar2)
         centralwidget.setLayout(mainlay)
-
-        # Simulation Init
         self.graph_manager = GraphManager()
-        self.director = Director(self.graph_manager, self.scene, self.log_output, self.collisionLabel, self.standoffLabel)
+        self.director = Director(self.graph_manager, self.scene, self.log_output, self.collisionLabel, self.standoffLabel, self.telemetry_label)
         self.timer = QTimer()
         self.timer.timeout.connect(self.director.update)
         self.sim_running = False
-        
-        # Auto-load for debugging
-        import os
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        nodes_path = os.path.join(base_dir, "nodesEXPORT.geojson")
-        edges_path = os.path.join(base_dir, "linesEXPORT.geojson")
-        
-        if os.path.exists(nodes_path) and os.path.exists(edges_path):
-            print("Auto-loading debug files...")
-            self.load_nodes_file(nodes_path)
-            self.load_edges_file(edges_path)
-            self.toggle_simulation()
 
     def update_speed(self, value):
-        # 1x to 100x
-        # Base speed is 0.1
-        # Slider 1 -> 0.1
-        # Slider 100 -> 10.0
-        multiplier = value
+        multiplier = value / 2.0
         self.director.set_speed_multiplier(multiplier)
 
     def toggle_simulation(self):
         self.sim_running = not self.sim_running
         if self.sim_running:
-            self.timer.start(16) # ~60 FPS
+            self.timer.start(16)
             self.label.setText("Simulation: RUNNING")
         else:
             self.timer.stop()
             self.label.setText("Simulation: PAUSED")
-
-
-    # sidebar functions
     def showEvent(self, event):
         super().showEvent(event)
         self.updateBtn2Pos()
@@ -805,11 +717,35 @@ class MainWindow(QMainWindow):
             self.sidebar2.show()
             self.updateBtn2Pos()
             self.btn2.setText(">")
-    # --- GeoJSON loading and drawing ---
-    def _load_world_file(self):
-        """Load georeferencing parameters from .pgw file."""
+    def open_map_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Open Map Image", "", "Images (*.png *.jpg *.jpeg *.tif *.tiff);;All Files (*)")
+        if path:
+            self.load_map_file(path)
+
+    def load_map_file(self, path):
+        self.scene.clear()
+        self.graph_manager = GraphManager()
+        self.director = Director(self.graph_manager, self.scene, self.log_output, self.collisionLabel, self.standoffLabel, self.telemetry_label)
+        self.timer.timeout.disconnect()
+        self.timer.timeout.connect(self.director.update)
+        
+        self.map_pixmap = QPixmap(path)
+        self.scene.addPixmap(self.map_pixmap)
         try:
-            with open("chicagohare.pgw", "r") as f:
+            self.scene.setSceneRect(0, 0, self.map_pixmap.width(), self.map_pixmap.height())
+        except: pass
+        base, ext = os.path.splitext(path)
+        possible_pgw = base + ".pgw"
+        if os.path.exists(possible_pgw):
+             self._load_world_file(possible_pgw)
+        else:
+             print("No world file found, manual scaling might be needed (not implemented).")
+             self.pgw_pixel_width = None
+
+    def _load_world_file(self, path):
+        
+        try:
+            with open(path, "r") as f:
                 lines = f.readlines()
             self.pgw_pixel_width = float(lines[0].strip())
             self.pgw_rotation_x = float(lines[1].strip())
@@ -817,19 +753,14 @@ class MainWindow(QMainWindow):
             self.pgw_pixel_height = float(lines[3].strip())
             self.pgw_top_left_x = float(lines[4].strip())
             self.pgw_top_left_y = float(lines[5].strip())
-            # Prepare optional transformer (WGS84 lon/lat -> image projected coords)
             self.transformer = None
             if _HAVE_PYPROJ:
-                # Try common projected CRSes used for Chicago (UTM zone 16N / NAD83)
-                for tgt in ("EPSG:32616", "EPSG:26916"):
+                candidates = ["EPSG:32616", "EPSG:26916", "EPSG:32618", "EPSG:26918"] 
+                for tgt in candidates:
                     try:
                         t = Transformer.from_crs("EPSG:4326", tgt, always_xy=True)
-                        # Test transform near average lat/lon for Chicago
-                        tx, ty = t.transform(-87.9, 41.97)
-                        # Accept transformer if results are in same ballpark as pgw values
-                        if 0 < abs(tx) < 1e7 and 0 < abs(ty) < 1e8:
-                            self.transformer = t
-                            break
+                        self.transformer = t 
+                        break
                     except Exception:
                         continue
         except Exception as e:
@@ -837,20 +768,16 @@ class MainWindow(QMainWindow):
             self.pgw_pixel_width = None
 
     def _geo_to_pixel(self, lon, lat):
-        """Convert geographic coordinates to pixel coordinates using world file."""
+        
         if self.pgw_pixel_width is None:
-            # Fallback to old method if world file not available
             return None
-        # Convert lon/lat (decimal degrees) to projected coordinates
         if hasattr(self, 'transformer') and self.transformer is not None:
             try:
                 x_map, y_map = self.transformer.transform(lon, lat)
             except Exception:
                 return None
         else:
-            # No reliable transformer available
             return None
-        # Transform using world file parameters
         pixel_x = (x_map - self.pgw_top_left_x) / self.pgw_pixel_width
         pixel_y = (y_map - self.pgw_top_left_y) / self.pgw_pixel_height
         return pixel_x, pixel_y
@@ -896,7 +823,6 @@ class MainWindow(QMainWindow):
             name = props.get("name") or props.get("ref") or "taxiway"
             
             if start_id is None or end_id is None:
-                # try geometry-based edges (LineString with two coords)
                 geom = feat.get("geometry", {})
                 coords = geom.get("coordinates", [])
                 if len(coords) >= 2:
@@ -907,14 +833,11 @@ class MainWindow(QMainWindow):
             self._draw_edges(edges)
 
     def _draw_nodes(self, nodes):
-        # clear previous node items
         for item in getattr(self, 'node_items', {}).values():
             self.scene.removeItem(item)
         self.node_items = {}
         self.node_positions = {}
-        self.original_node_positions = {}  # Store original positions for scaling
-        
-        # If world file is loaded, try georeferencing; if that fails, fall back to bbox-fitting
+        self.original_node_positions = {}
         used_georef = False
         if self.pgw_pixel_width is not None:
             converted = []
@@ -928,8 +851,6 @@ class MainWindow(QMainWindow):
                     pt = QPointF(pixel_x, pixel_y)
                     self.node_positions[n["id"]] = pt
                     self.original_node_positions[n["id"]] = pt
-                    
-                    # POPULATE GRAPH
                     self.graph_manager.add_node(n["id"], (pixel_x, pixel_y), n["type"])
                     
                     color = Qt.GlobalColor.blue
@@ -944,15 +865,17 @@ class MainWindow(QMainWindow):
                     ellipse.setToolTip(f"id: {n['id']} type: {n['type']}")
                     self.scene.addItem(ellipse)
                     self.node_items[n["id"]] = ellipse
-        # If georeferencing was not usable, fall back to bbox-fitting
         if not used_georef:
             lons = [n["lon"] for n in nodes]
             lats = [n["lat"] for n in nodes]
             min_lon, max_lon = min(lons), max(lons)
             min_lat, max_lat = min(lats), max(lats)
-            # map into background image pixel dimensions so overlay aligns with image
-            view_w = max(100, self.chicagohare.width())
-            view_h = max(100, self.chicagohare.height())
+            if hasattr(self, 'map_pixmap') and self.map_pixmap:
+                view_w = max(100, self.map_pixmap.width())
+                view_h = max(100, self.map_pixmap.height())
+            else:
+                view_w = 2000
+                view_h = 2000
             margin = 40
             lon_span = max_lon - min_lon if max_lon - min_lon != 0 else 1.0
             lat_span = max_lat - min_lat if max_lat - min_lat != 0 else 1.0
@@ -964,8 +887,6 @@ class MainWindow(QMainWindow):
                 pt = QPointF(x, y)
                 self.node_positions[n["id"]] = pt
                 self.original_node_positions[n["id"]] = pt
-                
-                # POPULATE GRAPH
                 self.graph_manager.add_node(n["id"], (x, y), n["type"])
                 
                 color = Qt.GlobalColor.blue
@@ -980,8 +901,6 @@ class MainWindow(QMainWindow):
                 ellipse.setToolTip(f"id: {n['id']} type: {n['type']}")
                 self.scene.addItem(ellipse)
                 self.node_items[n["id"]] = ellipse
-        
-        # Find top-left reference point for manual scale (deprecated but kept)
         if self.node_positions:
             self.graph_ref_point = QPointF(
                 min(pt.x() for pt in self.original_node_positions.values()),
@@ -989,11 +908,10 @@ class MainWindow(QMainWindow):
             )
 
     def _draw_edges(self, edges):
-        # remove previous edges
         for e in getattr(self, 'edge_items', []):
             self.scene.removeItem(e)
         self.edge_items = []
-        self._edge_pairs = []  # Store edge pairs for repositioning
+        self._edge_pairs = []
         pen = QPen(Qt.GlobalColor.darkGray)
         pen.setWidth(2)
         for ed in edges:
@@ -1004,8 +922,6 @@ class MainWindow(QMainWindow):
                 t = self.node_positions.get(v)
                 if s is not None and t is not None:
                      self.graph_manager.add_edge(u, v, {'name': ed.get('name', 'taxiway')})
-                     
-                     # Visual line
                      ux, uy = self.graph_manager.get_pos(u)
                      vx, vy = self.graph_manager.get_pos(v)
                      line = QGraphicsLineItem(ux, uy, vx, vy)
@@ -1014,18 +930,11 @@ class MainWindow(QMainWindow):
                      self.edge_items.append(line)
                 self._edge_pairs.append((ed["start"], ed["end"]))
             else:
-                # coords provided directly - skip for now
                 continue
-
-    # Positioning/scale functionality removed (automatic georeference used)
-    # other shi
     
 
     
     
-
-
-
 
     
 if __name__ == "__main__":
