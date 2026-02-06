@@ -59,6 +59,21 @@ class ReservationManager:
             self.edge_res[k] = [r for r in self.edge_res[k] if r[1] > threshold]
             if not self.edge_res[k]: del self.edge_res[k]
 
+    def get_edge_reservations(self, u, v):
+        key = tuple(sorted((u, v)))
+        return list(self.edge_res.get(key, []))
+
+    def cancel_future_reservations(self, pid, from_time=0.0):
+        # remove any reservations for pid that start at or after from_time
+        for k in list(self.node_res.keys()):
+            self.node_res[k] = [r for r in self.node_res[k] if not (r[2] == pid and r[0] >= from_time)]
+            if not self.node_res[k]:
+                del self.node_res[k]
+        for k in list(self.edge_res.keys()):
+            self.edge_res[k] = [r for r in self.edge_res[k] if not (r[2] == pid and r[0] >= from_time)]
+            if not self.edge_res[k]:
+                del self.edge_res[k]
+
 class InteractiveGraphicsView(QGraphicsView):
     
     def __init__(self, parent=None):
@@ -260,6 +275,8 @@ class Plane:
         self.target_node = None
         self.pos = list(self.graph.get_pos(start_node))
         self.speed = DEFAULT_SPEED
+        self.res_manager = None
+        self.assigned_reservations = []
         self.heading = 0.0
         self.state = "IDLE"
         self.color = Qt.GlobalColor.magenta
@@ -304,13 +321,33 @@ class Plane:
              self.state = "AWAITING_INSTRUCTION"
 
     def update(self, dt_sec, obstacles, speed_mult=1.0):
+        # compute distance to current node (used to decide if we are 'at node')
+        try:
+            curr_node_pos = self.graph.get_pos(self.current_node)
+            dist_to_node = math.hypot(self.pos[0] - curr_node_pos[0], self.pos[1] - curr_node_pos[1])
+        except Exception:
+            dist_to_node = 0
+
+        AT_NODE_EPS = 1e-3
+
         if self.state == "AWAITING_INSTRUCTION":
             self.item.setBrush(QBrush(Qt.GlobalColor.magenta))
             return
-            
+
         if self.state == "STOPPED":
-            self.item.setBrush(QBrush(Qt.GlobalColor.red))
-            return
+            # if at node, check whether the next edge is now free and resume
+            if self.target_node and self.res_manager is not None and dist_to_node <= AT_NODE_EPS:
+                travel_time = self.graph.heuristic(self.current_node, self.target_node) / PLANE_SPEED
+                depart_time = getattr(self, 'current_time', 0.0)
+                arrive_time = depart_time + travel_time
+                if self.res_manager.is_free_edge(self.current_node, self.target_node, depart_time, arrive_time, exclude_pid=self.id):
+                    self.state = "MOVING"
+                else:
+                    self.item.setBrush(QBrush(Qt.GlobalColor.red))
+                    return
+            else:
+                self.item.setBrush(QBrush(Qt.GlobalColor.red))
+                return
 
         if self.state == "HOLD":
             self.item.setBrush(QBrush(Qt.GlobalColor.yellow))
@@ -342,7 +379,52 @@ class Plane:
         
         current_speed = self.speed * speed_mult
         
-        if dist < current_speed:
+        # If we are at the node and about to depart to target, enforce that we hold a valid reservation
+        if dist_to_node <= AT_NODE_EPS:
+            travel_time = self.graph.heuristic(self.current_node, self.target_node) / PLANE_SPEED
+            depart_time = getattr(self, 'current_time', 0.0)
+            arrive_time = depart_time + travel_time
+            # check for an assigned reservation that overlaps the desired interval
+            has_own_res = False
+            eps = 0.2
+            for r in (self.assigned_reservations or []):
+                if r.get('u') == self.current_node and r.get('v') == self.target_node:
+                    # overlap test
+                    r0 = r.get('depart', -1e9)
+                    r1 = r.get('arrive', 1e9)
+                    if not (arrive_time + eps < r0 or depart_time - eps > r1):
+                        has_own_res = True
+                        break
+
+            if not has_own_res:
+                # if we don't have an assigned reservation, but the edge is free now, book it atomically
+                if self.res_manager.is_free_edge(self.current_node, self.target_node, depart_time, arrive_time, exclude_pid=None):
+                    # book edge and arrival node for ourselves
+                    self.res_manager.book_edge(self.current_node, self.target_node, depart_time, arrive_time, self.id)
+                    self.res_manager.book_node(self.target_node, arrive_time, arrive_time + SEPARATION_TIME, self.id)
+                    # attach to assigned reservations
+                    self.assigned_reservations = (self.assigned_reservations or []) + [{'u': self.current_node, 'v': self.target_node, 'depart': depart_time, 'arrive': arrive_time}]
+                    has_own_res = True
+
+            if not has_own_res:
+                self.state = "STOPPED"
+                self.stopped_timer = 0.0
+                self.item.setBrush(QBrush(Qt.GlobalColor.red))
+                # log reason for stopping
+                try:
+                    blocker_list = [ (s,e,pid) for (s,e,pid) in self.res_manager.get_edge_reservations(self.current_node, self.target_node) if not (arrive_time <= s or depart_time >= e) ]
+                    if blocker_list:
+                        self.graph  # use to avoid lint
+                        # append a short log to director if available
+                        # (Director.log_msg expects ATC-style messages; use plane id)
+                        # find director via item callback if possible
+                except Exception:
+                    pass
+                return
+
+        step = current_speed * dt_sec
+
+        if dist <= step:
             self.pos = [tx, ty]
             self.current_node = self.target_node
             
@@ -359,8 +441,8 @@ class Plane:
                 self.target_node = None
                 self.state = "AWAITING_INSTRUCTION"
         else:
-            move_x = (dx / dist) * self.speed
-            move_y = (dy / dist) * self.speed
+            move_x = (dx / dist) * step
+            move_y = (dy / dist) * step
             self.pos[0] += move_x
             self.pos[1] += move_y
 
@@ -408,7 +490,7 @@ class Director:
     def set_speed_multiplier(self, val):
         self.speed_multiplier = val
         for p in self.planes:
-            p.speed = DEFAULT_SPEED * self.speed_multiplier
+            p.speed = PLANE_SPEED * self.speed_multiplier
 
     def spawn_plane(self):
         if len(self.planes) >= 50: 
@@ -431,7 +513,8 @@ class Director:
             return
 
         p = Plane(self.plane_id_counter, start, end, self.graph, self.select_plane, is_arrival)
-        p.speed = DEFAULT_SPEED * self.speed_multiplier
+        p.speed = PLANE_SPEED * self.speed_multiplier
+        p.res_manager = self.res_manager
         full_path = self.graph.find_path(
             start, end, 
             start_time=self.global_time, 
@@ -441,16 +524,20 @@ class Director:
         
         if full_path:
             curr_t = self.global_time
+            reservations = []
             for i in range(len(full_path) - 1):
                 u = full_path[i]
                 v = full_path[i+1]
                 dist = self.graph.heuristic(u, v)
                 arrival_t = curr_t + (dist / PLANE_SPEED)
                 self.res_manager.book_edge(u, v, curr_t, arrival_t, self.plane_id_counter)
+                reservations.append({'u': u, 'v': v, 'depart': curr_t, 'arrive': arrival_t})
                 self.res_manager.book_node(v, arrival_t, arrival_t + SEPARATION_TIME, self.plane_id_counter)
                 
                 curr_t = arrival_t
             self.res_manager.book_node(start, self.global_time, self.global_time + SEPARATION_TIME, self.plane_id_counter)
+
+            p.assigned_reservations = reservations
 
             self.flight_plans[self.plane_id_counter] = {
                 'full_path': full_path,
@@ -467,6 +554,96 @@ class Director:
             
         else:
             pass
+
+    def spawn_headon_test(self):
+        """Spawn two planes at ends of a path so they will attempt head-on traversal.
+        This uses naive planning (no prior reservations) and then books both plans
+        into the real reservation table to reproduce and test conflicts."""
+        # find a pair of nodes with a path length >= 2
+        nodes = list(self.graph.nodes.keys())
+        pair = None
+        # BFS from each node to find any reachable other node
+        for a in nodes:
+            visited = {a}
+            queue = [a]
+            parent = {a: None}
+            while queue:
+                x = queue.pop(0)
+                for y in self.graph.adj.get(x, []):
+                    if y not in visited:
+                        visited.add(y)
+                        parent[y] = x
+                        queue.append(y)
+                        # require at least 2 edges between endpoints
+                        # reconstruct path length
+                        path = [y]
+                        cur = y
+                        while parent[cur] is not None:
+                            cur = parent[cur]
+                            path.append(cur)
+                        if len(path) >= 3:
+                            pair = (a, y)
+                            break
+                if pair: break
+            if pair: break
+
+        if not pair:
+            self.log_msg("Head-on test: could not find suitable node pair")
+            return
+
+        a, b = pair
+        # create two planes
+        pid1 = self.plane_id_counter
+        pid2 = self.plane_id_counter + 1
+
+        p1 = Plane(pid1, a, b, self.graph, self.select_plane, is_arrival=False)
+        p2 = Plane(pid2, b, a, self.graph, self.select_plane, is_arrival=False)
+        p1.speed = PLANE_SPEED * self.speed_multiplier
+        p2.speed = PLANE_SPEED * self.speed_multiplier
+        p1.res_manager = self.res_manager
+        p2.res_manager = self.res_manager
+
+        # plan naively without considering other reservations
+        temp_res = ReservationManager()
+        path1 = self.graph.find_path(a, b, start_time=self.global_time, reservation_manager=temp_res, pid=pid1)
+        path2 = self.graph.find_path(b, a, start_time=self.global_time, reservation_manager=temp_res, pid=pid2)
+
+        if not path1 or not path2:
+            self.log_msg("Head-on test: could not compute naive paths")
+            return
+
+        # book both plans into the real reservation manager so they overlap
+        def book_plan(path, pid):
+            curr_t = self.global_time
+            reservations = []
+            self.res_manager.book_node(path[0], curr_t, curr_t + SEPARATION_TIME, pid)
+            for i in range(len(path)-1):
+                u = path[i]; v = path[i+1]
+                dist = self.graph.heuristic(u, v)
+                arrival_t = curr_t + (dist / PLANE_SPEED)
+                # add small margins so overlap is likely
+                eps = 0.01
+                self.res_manager.book_edge(u, v, curr_t - eps, arrival_t + eps, pid)
+                self.res_manager.book_node(v, arrival_t, arrival_t + SEPARATION_TIME, pid)
+                reservations.append({'u': u, 'v': v, 'depart': curr_t - eps, 'arrive': arrival_t + eps})
+                curr_t = arrival_t
+            return reservations
+
+        res1 = book_plan(path1, pid1)
+        res2 = book_plan(path2, pid2)
+
+        # store flight plans
+        self.flight_plans[pid1] = {'full_path': path1, 'next_index': 0, 'cleared_to': 0}
+        self.flight_plans[pid2] = {'full_path': path2, 'next_index': 0, 'cleared_to': 0}
+
+        # add to scene and plane list
+        p1.assigned_reservations = res1
+        p2.assigned_reservations = res2
+        self.planes.append(p1); self.scene.addItem(p1.item)
+        self.planes.append(p2); self.scene.addItem(p2.item)
+        self.plane_id_counter += 2
+        self.log_msg(f"Head-on test: spawned {pid1} at {a} -> {b}")
+        self.log_msg(f"Head-on test: spawned {pid2} at {b} -> {a}")
 
     def log_msg(self, msg, pid=None):
         target_pid = pid
@@ -592,7 +769,63 @@ class Director:
                             p.state = "HOLD_SHORT"
                             self.log_msg(f"ATC: UKN{p.id}, Hold position, traffic on final.")
                             continue
-            p.update(1/60, self.planes)
+            p.current_time = self.global_time
+            dt = (1/60) * self.speed_multiplier
+            p.update(dt, self.planes)
+            if p.state == "STOPPED":
+                p.stopped_timer = getattr(p, 'stopped_timer', 0.0) + dt
+                if p.stopped_timer > 1.0:
+                    self.resolve_block(p)
+            else:
+                p.stopped_timer = 0.0
+
+    def resolve_block(self, p):
+        # Attempt simple resolution: find blocking reservation on next edge and replan that blocker
+        if not p.target_node:
+            return
+        u = p.current_node
+        v = p.target_node
+        travel_time = self.graph.heuristic(u, v) / PLANE_SPEED
+        depart = self.global_time
+        arrive = depart + travel_time
+        # find conflicting reservations on the same undirected edge
+        conflicts = []
+        for s, e, pid in self.res_manager.get_edge_reservations(u, v):
+            if pid == p.id: continue
+            if not (arrive <= s or depart >= e):
+                conflicts.append(pid)
+        if not conflicts:
+            return
+        # choose a blocker to delay (simple heuristic: highest pid)
+        blocker_pid = max(conflicts)
+        self.log_msg(f"Resolving block: plane {p.id} blocked on edge {u}-{v} by {blocker_pid}")
+        # cancel future reservations for blocker and attempt to replan blocker from its current node
+        self.res_manager.cancel_future_reservations(blocker_pid, from_time=self.global_time)
+        blocker = next((q for q in self.planes if q.id == blocker_pid), None)
+        if not blocker:
+            return
+        # compute a new path for blocker avoiding current reservations
+        new_path = self.graph.find_path(blocker.current_node, blocker.destination_node, start_time=self.global_time, reservation_manager=self.res_manager, pid=blocker.id)
+        if not new_path:
+            # if replan fails, keep blocker stopped a bit longer
+            self.log_msg(f"Resolving block: could not replan blocker {blocker_pid}")
+            return
+        # book new reservations for blocker along new_path
+        curr_t = self.global_time
+        new_res = []
+        for i in range(len(new_path) - 1):
+            uu = new_path[i]; vv = new_path[i+1]
+            dist = self.graph.heuristic(uu, vv)
+            arrival_t = curr_t + (dist / PLANE_SPEED)
+            self.res_manager.book_edge(uu, vv, curr_t, arrival_t, blocker.id)
+            new_res.append({'u': uu, 'v': vv, 'depart': curr_t, 'arrive': arrival_t})
+            self.res_manager.book_node(vv, arrival_t, arrival_t + SEPARATION_TIME, blocker.id)
+            curr_t = arrival_t
+        # update blocker flight plan and reset its state so it can resume
+        self.flight_plans[blocker.id] = {'full_path': new_path, 'next_index': 0, 'cleared_to': 0}
+        blocker.set_path(new_path)
+        blocker.assigned_reservations = new_res
+        blocker.stopped_timer = 0.0
 
 class MainWindow(QMainWindow):
     def __init__(self):
@@ -615,6 +848,7 @@ class MainWindow(QMainWindow):
         self.loadMapBtn = QPushButton("Load Map Image")
         self.loadNodesBtn = QPushButton("Load Nodes")
         self.loadEdgesBtn = QPushButton("Load Edges")
+        self.headonTestBtn = QPushButton("Head-on Test")
         self.startSimBtn = QPushButton("Start/Stop Sim")
         self.pgw_pixel_width = None
         self.pgw_rotation_x = None
@@ -630,6 +864,7 @@ class MainWindow(QMainWindow):
         sidebar1lay.addWidget(self.loadMapBtn)
         sidebar1lay.addWidget(self.loadNodesBtn)
         sidebar1lay.addWidget(self.loadEdgesBtn)
+        sidebar1lay.addWidget(self.headonTestBtn)
         sidebar1lay.addWidget(self.startSimBtn)
         self.collisionLabel = QLabel("Collisions: 0")
         self.standoffLabel = QLabel("Standoffs: 0")
@@ -662,6 +897,7 @@ class MainWindow(QMainWindow):
         self.loadMapBtn.clicked.connect(self.open_map_dialog)
         self.loadNodesBtn.clicked.connect(self.open_nodes_dialog)
         self.loadEdgesBtn.clicked.connect(self.open_edges_dialog)
+        self.headonTestBtn.clicked.connect(lambda: self.director.spawn_headon_test())
         self.startSimBtn.clicked.connect(self.toggle_simulation)
         self.sidebar1.hide()
         mainlay = QHBoxLayout()
